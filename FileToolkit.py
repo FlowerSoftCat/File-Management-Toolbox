@@ -12,6 +12,20 @@ from tkinter.font import Font
 from collections import defaultdict
 import re
 
+# 发票助手依赖（非必需，缺失时功能降级提示）
+try:
+    import fitz
+except ImportError:
+    fitz = None
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 # ===================== 通用工具函数 =====================
 def safe_delete(file_path):
     """安全删除文件"""
@@ -55,8 +69,37 @@ def parse_multi_selection(input_str, max_num):
     return sorted(list(set(selected_indexes)))
 
 # ===================== 压缩包修复功能 =====================
-# 标准压缩后缀集合
-STANDARD_COMPRESS_SUFFIXES = {'rar', 'zip', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'cab', 'arj', 'lzh', 'z', 'tgz', 'zst', 'lz4', 'lzma'}
+# 标准压缩后缀（常用在前）
+STANDARD_COMPRESS_SUFFIXES = ['7z', 'rar', 'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'iso', 'zst', 'lz4', 'lzma']
+STANDARD_COMPRESS_SET = set(STANDARD_COMPRESS_SUFFIXES)
+
+# 下载临时文件后缀（下载中/未完成的文件，不应被修改）
+TEMP_DOWNLOAD_SUFFIXES = {
+    '.part', '.download', '.crdownload', '.tmp', '.temp', '.partial',
+    '.dl', '.downloading', '.!ut', '.bc!', '.wk!', '.ba_', '.incomplete',
+    '.opdownload', '.xx', '.!bt', '.!qb', '.!sync', '.aria2',
+}
+
+# 常见非压缩文件后缀（媒体/系统/文档等，避免误判为"问题文件"）
+NON_COMPRESS_FILE_SUFFIXES = {
+    # 媒体文件
+    '.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.m4v', '.3gp',
+    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a',
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.psd',
+    # 系统/可执行文件
+    '.exe', '.dll', '.sys', '.msi', '.bat', '.cmd', '.ps1', '.vbs',
+    '.lnk', '.url', '.ini', '.cfg', '.conf', '.log',
+    # 文档文件
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf',
+    '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm', '.css', '.js', '.py',
+    '.java', '.c', '.cpp', '.h', '.cs', '.ts', '.rs', '.go',
+    # 字体文件
+    '.ttf', '.otf', '.woff', '.woff2', '.eot',
+    # 数据库
+    '.db', '.sqlite', '.sqlite3', '.mdb', '.accdb',
+    # 其他常见
+    '.torrent', '.nfo', '.sfv', '.md5', '.sha1', '.sha256',
+}
 
 # 压缩文件魔数映射
 COMPRESS_MAGIC_MAP = {
@@ -92,7 +135,7 @@ def analyze_file_problem(filename):
     matched_suffix = None
     suffix_pos = -1
     
-    for suffix in sorted(STANDARD_COMPRESS_SUFFIXES, key=len, reverse=True):
+    for suffix in sorted(STANDARD_COMPRESS_SET, key=len, reverse=True):
         pos = filename_lower.find(f'.{suffix}')
         if pos != -1:
             matched_suffix = suffix
@@ -113,7 +156,7 @@ def analyze_file_problem(filename):
 
     parts = filename.split('.')
     last_part = parts[-1].lower()
-    for suffix in sorted(STANDARD_COMPRESS_SUFFIXES, key=len, reverse=True):
+    for suffix in sorted(STANDARD_COMPRESS_SET, key=len, reverse=True):
         if last_part.startswith(suffix):
             correct_body = '.'.join(parts[:-1])
             return ("后缀被篡改", f"后缀[{last_part}]包含多余字符，匹配标准后缀[{suffix}]", correct_body, suffix)
@@ -131,6 +174,122 @@ def get_correct_filename(filename, real_suffix=None):
         return None, problem_type, problem_desc
     base_name = f"{correct_body}.{final_suffix}"
     return base_name, problem_type, problem_desc
+
+# ===================== 发票金额计算 =====================
+def _chinese_to_num(cn_str):
+    """中文大写金额转阿拉伯数字"""
+    cn_map = {'零':0, '壹':1, '贰':2, '叁':3, '肆':4, '伍':5, '陆':6, '柒':7, '捌':8, '玖':9}
+    unit_map = {'拾':10, '佰':100, '仟':1000, '万':10000, '元':1, '圆':1, '角':0.1, '分':0.01}
+    cn_str = re.sub(r'[整正()（）\s￥¥]', '', cn_str)
+    if not cn_str or len(cn_str) < 2:
+        return None
+    total = 0.0
+    temp = 0
+    for i, char in enumerate(cn_str):
+        if char in cn_map:
+            temp = cn_map[char]
+            if i == len(cn_str) - 1:
+                total += temp * 0.1
+        elif char in unit_map:
+            unit = unit_map[char]
+            if unit == 10000:
+                total = (total + temp) * unit
+                temp = 0
+            else:
+                total += temp * unit
+                temp = 0
+    return round(total, 2) if total > 0 else None
+
+def _num_to_rmb(num):
+    """数字转人民币大写"""
+    cap = ['零','壹','贰','叁','肆','伍','陆','柒','捌','玖']
+    unit = ['元','拾','佰','仟','万']
+    decimal = ['角','分']
+    num = round(num, 2)
+    integer = int(num)
+    dec = int((num - integer) * 100)
+    int_part = ''
+    if integer == 0:
+        int_part = '零元'
+    else:
+        s = str(integer)
+        l = len(s)
+        for i in range(l):
+            d = int(s[i])
+            p = l - 1 - i
+            if d != 0:
+                int_part += cap[d] + unit[p]
+            else:
+                if int_part and not int_part.endswith('零'):
+                    int_part += '零'
+        while int_part and int_part.endswith('零'):
+            int_part = int_part[:-1]
+        if not int_part.endswith('元'):
+            int_part += '元'
+    dec_part = ''
+    if dec == 0:
+        dec_part = '整'
+    else:
+        j = dec // 10
+        f = dec % 10
+        if j != 0:
+            dec_part += cap[j] + '角'
+        if f != 0:
+            if j == 0 and integer != 0:
+                dec_part += '零'
+            dec_part += cap[f] + '分'
+    if dec_part == '整':
+        return int_part + dec_part
+    else:
+        return f"{int_part} · {dec_part}"
+
+def _extract_any_amount(text):
+    """从文本中提取金额"""
+    capital_patterns = [
+        r'[零壹贰叁肆伍陆柒捌玖拾佰仟万]+元[零壹贰叁肆伍陆柒捌玖]*角?[零壹贰叁肆伍陆柒捌玖]*分?整?',
+        r'价税合计.*?([零壹贰叁肆伍陆柒捌玖拾佰仟万元圆角分整]+)',
+        r'合计.*?([零壹贰叁肆伍陆柒捌玖拾佰仟万元圆角分整]+)',
+        r'大写.*?([零壹贰叁肆伍陆柒捌玖拾佰仟万元圆角分整]+)'
+    ]
+    for pattern in capital_patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            amt = _chinese_to_num(match.group(1))
+            if amt and amt > 0:
+                return amt, match.group(1).strip()
+    lower_patterns = [
+        r'[¥￥](\d+\.?\d*)',
+        r'价税合计.*?(\d+\.?\d*)',
+        r'合计.*?(\d+\.?\d*)元?',
+        r'金额.*?(\d+\.?\d*)元?',
+        r'实付.*?(\d+\.?\d*)',
+        r'支付.*?(\d+\.?\d*)'
+    ]
+    for pattern in lower_patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            try:
+                amt = float(match.group(1))
+                if amt > 0:
+                    return amt, f"¥{amt:.2f}"
+            except:
+                pass
+    return None, None
+
+def _is_formal_invoice(text):
+    return sum(1 for k in ['发票号码','纳税人识别号','统一社会信用代码','价税合计','电子发票'] if k in text) >= 2
+
+def _is_itinerary(text):
+    return sum(1 for k in ['行程单','上车时间','下车时间','里程','车型','起点','终点','出行日期','滴滴','曹操'] if k in text) >= 2
+
+def _classify_invoice(text):
+    if any(k in text for k in ['住宿','酒店','宾馆','房费','住宿费']):
+        return '住宿'
+    elif any(k in text for k in ['打车','滴滴','曹操','T3','网约车','客运','出行','行程单']):
+        return '打车'
+    elif any(k in text for k in ['高铁','动车','火车','铁路','G字头','D字头','C字头','二等座','一等座']):
+        return '高铁'
+    return '其他'
 
 # ===================== 视频处理功能 =====================
 def get_all_video_files(target_dir=None):
@@ -573,7 +732,11 @@ class MultiToolGUI:
         self.to_delete_files = []
         self.processed_video_files = []
         self.compress_file_list = []
+        self.compress_undo_stack = []
         self.video_files = []
+        self.rename_dir_var = tk.StringVar()
+        self.rename_keywords_var = tk.StringVar()
+        self.invoice_dir_var = tk.StringVar()
         # 提前初始化状态栏变量，确保调用前已存在
         self.status_var = tk.StringVar(value="就绪 | 请选择功能开始操作")
         
@@ -645,11 +808,21 @@ class MultiToolGUI:
         tab_control.add(self.subtitle_tab, text="🎬 视频字幕批量重命名")
         self.build_subtitle_tab()
         
+        # 6. 文件名关键词删除标签页
+        self.rename_tab = ttk.Frame(tab_control)
+        tab_control.add(self.rename_tab, text="✏️ 文件名关键词删除")
+        self.build_rename_tab()
+        
+        # 7. 发票金额计算标签页
+        self.invoice_tab = ttk.Frame(tab_control)
+        tab_control.add(self.invoice_tab, text="🧾 发票金额计算")
+        self.build_invoice_tab()
+        
         tab_control.pack(fill=tk.BOTH, expand=True)
         
         # 日志区域
         log_container = ttk.Frame(main_container)
-        log_container.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
+        log_container.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         
         log_frame = ttk.LabelFrame(log_container, 
                                   text="📝 操作日志",
@@ -714,7 +887,9 @@ class MultiToolGUI:
             'video': self.video_tab,
             'classify': self.classify_tab,
             'delete': self.delete_tab,
-            'subtitle': self.subtitle_tab
+            'subtitle': self.subtitle_tab,
+            'rename': self.rename_tab,
+            'invoice': self.invoice_tab
         }
         self.enable_tab_drag(tab_control)
 
@@ -839,212 +1014,125 @@ class MultiToolGUI:
                 messagebox.showerror("导出失败", f"日志导出失败：\n{str(e)}")
     
     def build_compress_tab(self):
-        """构建现代化压缩包修复界面"""
-        # 设置标签页背景
+        """构建压缩包修复界面"""
         self.compress_tab.configure(style="Tab.TFrame")
-        
-        # 主容器
         main_container = ttk.Frame(self.compress_tab)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
-        
-        # 1. 功能说明区域 - 卡片式设计
-        func_card = ttk.LabelFrame(main_container,
-                                  text="📦 压缩包修复功能说明",
-                                  padding=20)
-        func_card.pack(fill=tk.X, pady=(0, 15))
-        
-        # 功能说明标签
-        func_desc = ttk.Label(func_card,
-                             text="功能说明：自动检测并修复压缩包文件后缀问题，支持常见压缩格式（rar, zip, 7z, tar, gz, bz2, xz等）",
-                             font=("Microsoft YaHei", 10),
-                             foreground="#4E5969",
-                             wraplength=800)
-        func_desc.pack(fill=tk.X, pady=(5, 0))
-        
-        # 错误示例说明
-        example_frame = ttk.Frame(func_card)
-        example_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        example_label = ttk.Label(example_frame,
-                                 text="📌 常见错误后缀示例：",
-                                 font=("Microsoft YaHei", 10, "bold"),
-                                 foreground="#1D2129")
-        example_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        examples = [
-            "• 无后缀：archive（应为 archive.7z）",
-            "• 后缀夹杂其他字符：archive.rar.txt（应为 archive.rar）",
-            "• 后缀缺失关键字符：archive.zi（应为 archive.zip）",
-            "• 多无效实心点：archive..rar（应为 archive.rar）",
-            "• 后缀被篡改：archive.rar_backup（应为 archive.rar）"
-        ]
-        
-        for example in examples:
-            example_text = ttk.Label(example_frame,
-                                    text=example,
-                                    font=("Microsoft YaHei", 9),
-                                    foreground="#86909C")
-            example_text.pack(anchor=tk.W, padx=(20, 0))
-        
-        # 2. 目录选择区域 - 卡片式设计
-        dir_card = ttk.LabelFrame(main_container, 
-                                 text="📂 目标目录设置",
-                                 padding=20)
-        dir_card.pack(fill=tk.X, pady=(0, 15))
-        
-        # 目录输入行
-        dir_row = ttk.Frame(dir_card)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        # 1. 简介行
+        intro = ttk.Label(main_container,
+                          text="自动检测并修正压缩包文件后缀（rar / zip / 7z / tar / gz 等），支持魔数识别真实格式，自动跳过下载临时文件和非压缩文件",
+                          font=("Microsoft YaHei", 9), foreground="#86909C", wraplength=900)
+        intro.pack(fill=tk.X, pady=(0, 6))
+
+        # 2. 目录 + 递归扫描（醒目）
+        top_card = ttk.LabelFrame(main_container, text="扫描设置", padding=8)
+        top_card.pack(fill=tk.X, pady=(0, 6))
+
+        dir_row = ttk.Frame(top_card)
         dir_row.pack(fill=tk.X)
-        
-        ttk.Label(dir_row, 
-                 text="目录路径：",
-                 font=("Microsoft YaHei", 10, "bold"),
-                 foreground="#1D2129").pack(side=tk.LEFT, padx=(0, 10))
-        
+        ttk.Label(dir_row, text="目录：", font=self.normal_font).pack(side=tk.LEFT, padx=(0, 6))
         self.compress_dir_var = tk.StringVar(value="")
-        dir_entry = ttk.Entry(dir_row, 
-                             textvariable=self.compress_dir_var,
-                             font=self.normal_font,
-                             width=50)
-        dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        
-        # 按钮组
-        btn_group = ttk.Frame(dir_row)
-        btn_group.pack(side=tk.RIGHT)
-        
-        ttk.Button(btn_group, 
-                  text="📁 浏览",
-                  command=self.select_compress_dir,
-                  style="Secondary.TButton",
-                  width=8).pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(btn_group,
-                  text="🔄 扫描",
-                  command=self.scan_compress_files,
-                  style="Primary.TButton",
-                  width=8).pack(side=tk.LEFT)
-        
-        # 3. 文件列表区域 - 现代化表格
-        list_card = ttk.LabelFrame(main_container,
-                                  text="📋 文件列表与问题分析",
-                                  padding=15)
-        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-        
-        # 表格工具栏
+        ttk.Entry(dir_row, textvariable=self.compress_dir_var, font=self.normal_font, width=40).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(dir_row, text="浏览", command=self.select_compress_dir, width=6).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(dir_row, text="扫描", command=self.scan_compress_files, style="Primary.TButton", width=6).pack(side=tk.LEFT)
+
+        opt_row = ttk.Frame(top_card)
+        opt_row.pack(fill=tk.X, pady=(6, 0))
+
+        # 递归扫描 - 醒目处理
+        recursive_frame = ttk.Frame(opt_row)
+        recursive_frame.pack(side=tk.LEFT, padx=(0, 20))
+        self.recursive_var = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(recursive_frame, text="递归扫描所有子文件夹", variable=self.recursive_var)
+        cb.pack(side=tk.LEFT)
+
+        ttk.Label(opt_row, text="目标后缀：", font=self.normal_font).pack(side=tk.LEFT, padx=(0, 4))
+        self.target_suffix_var = tk.StringVar(value="7z")
+        ttk.Combobox(opt_row, textvariable=self.target_suffix_var,
+                     values=STANDARD_COMPRESS_SUFFIXES,
+                     state="readonly", width=5).pack(side=tk.LEFT, padx=(0, 16))
+
+        self.scan_stats_label = ttk.Label(opt_row, text="", font=("Microsoft YaHei", 9), foreground="#4E5969")
+        self.scan_stats_label.pack(side=tk.LEFT)
+
+        # 3. 文件列表
+        list_card = ttk.LabelFrame(main_container, text="扫描结果", padding=8)
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
         toolbar = ttk.Frame(list_card)
-        toolbar.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(toolbar,
-                 text="共扫描到 0 个文件，其中 0 个存在问题",
-                 font=("Microsoft YaHei", 9),
-                 foreground="#86909C").pack(side=tk.LEFT)
-        
-        # 表格操作按钮
-        table_btns = ttk.Frame(toolbar)
-        table_btns.pack(side=tk.RIGHT)
-        
-        ttk.Button(table_btns,
-                  text="✅ 全选",
-                  command=self.select_all_compress,
-                  style="Secondary.TButton",
-                  width=8).pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(table_btns,
-                  text="🔄 反选",
-                  command=self.reverse_select_compress,
-                  style="Secondary.TButton",
-                  width=8).pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(table_btns,
-                  text="⚠️ 选有问题",
-                  command=self.select_problem_compress,
-                  style="Secondary.TButton",
-                  width=10).pack(side=tk.LEFT)
-        
-        # 表格区域
+        toolbar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(toolbar, text="全选", command=self.select_all_compress, width=6).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(toolbar, text="反选", command=self.reverse_select_compress, width=6).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(toolbar, text="仅选异常", command=self.select_problem_compress, width=8).pack(side=tk.LEFT)
+
         table_frame = ttk.Frame(list_card)
         table_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 定义表格列
-        columns = ("序号", "文件名", "问题类型", "问题描述", "处理状态")
-        self.compress_tree = ttk.Treeview(table_frame, 
-                                         columns=columns, 
-                                         show="headings",
-                                         height=15,
-                                         selectmode="extended")
-        
-        # 配置列宽和样式
-        column_configs = [
-            ("序号", 60, tk.CENTER),
-            ("文件名", 280, tk.W),
-            ("问题类型", 120, tk.CENTER),
-            ("问题描述", 350, tk.W),
-            ("处理状态", 100, tk.CENTER)
+
+        columns = ("#", "文件名", "所在目录", "真实格式", "问题类型", "大小", "状态")
+        self.compress_tree = ttk.Treeview(table_frame, columns=columns, show="headings",
+                                          height=10, selectmode="extended")
+
+        # 列配置：所有列平等分配空间，各级宽度按比例
+        col_specs = [
+            ("#",               40,  tk.CENTER),
+            ("文件名",          160, tk.W),
+            ("所在目录",        100, tk.W),
+            ("真实格式",        55,  tk.CENTER),
+            ("问题类型",        80,  tk.W),
+            ("大小",            70,  tk.E),
+            ("状态",            55,  tk.CENTER),
         ]
-        
-        for col, width, anchor in column_configs:
-            self.compress_tree.column(col, width=width, anchor=anchor)
-            self.compress_tree.heading(col, text=col)
-        
-        # 添加滚动条
-        v_scroll = ttk.Scrollbar(table_frame, 
-                                orient=tk.VERTICAL, 
-                                command=self.compress_tree.yview)
-        h_scroll = ttk.Scrollbar(table_frame,
-                                orient=tk.HORIZONTAL,
-                                command=self.compress_tree.xview)
-        self.compress_tree.configure(yscrollcommand=v_scroll.set,
-                                    xscrollcommand=h_scroll.set)
-        
-        # 布局表格和滚动条
+        for col_id, width, anchor in col_specs:
+            self.compress_tree.column(col_id, width=width, anchor=anchor, minwidth=width)
+            self.compress_tree.heading(col_id, text=col_id if col_id != "真实格式" else "格式", anchor=anchor)
+
+        v_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.compress_tree.yview)
+        h_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.compress_tree.xview)
+        self.compress_tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
         self.compress_tree.grid(row=0, column=0, sticky="nsew")
         v_scroll.grid(row=0, column=1, sticky="ns")
         h_scroll.grid(row=1, column=0, sticky="ew")
-        
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
-        
-        # 3. 操作按钮区域
-        action_card = ttk.LabelFrame(main_container,
-                                    text="⚙️ 批量操作",
-                                    padding=20)
-        action_card.pack(fill=tk.X)
-        
+
+        # 4. 操作栏
+        action_card = ttk.LabelFrame(main_container, text="操作", padding=8)
+        action_card.pack(fill=tk.X, pady=(0, 6))
+
         action_btns = ttk.Frame(action_card)
         action_btns.pack(expand=True)
-        
-        # 状态提示
-        status_label = ttk.Label(action_btns,
-                                text="已选中 0 个文件",
-                                font=("Microsoft YaHei", 10),
-                                foreground="#4E5969")
-        status_label.pack(side=tk.LEFT, padx=(0, 20))
-        
-        # 主要操作按钮
-        self.fix_compress_btn = ttk.Button(action_btns,
-                                          text="🚀 开始修复选中文件",
-                                          command=self.fix_compress_files,
-                                          style="Primary.TButton",
-                                          width=20)
-        self.fix_compress_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Button(action_btns,
-                  text="📊 导出报告",
-                  command=self.export_compress_report,
-                  style="Secondary.TButton",
-                  width=12).pack(side=tk.LEFT)
-        
-        # 绑定表格选择事件
-        self.compress_tree.bind("<<TreeviewSelect>>", 
-                               lambda e: self.on_compress_selection_change(status_label))
-        
-        # 初始化文件列表（延迟执行，避免时序问题）
+
+        self.compress_select_label = ttk.Label(action_btns, text="已选 0 个",
+                                               font=("Microsoft YaHei", 10), foreground="#4E5969")
+        self.compress_select_label.pack(side=tk.LEFT, padx=(0, 12))
+
+        self.fix_compress_btn = ttk.Button(action_btns, text="执行修复", command=self.fix_compress_files,
+                                           style="Primary.TButton", width=10)
+        self.fix_compress_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.undo_compress_btn = ttk.Button(action_btns, text="撤销", command=self.undo_compress,
+                                            width=6, state=tk.DISABLED)
+        self.undo_compress_btn.pack(side=tk.LEFT)
+
+        self.compress_tree.bind("<<TreeviewSelect>>",
+                                lambda e: self.on_compress_selection_change(self.compress_select_label))
+
         self.root.after(100, self.scan_compress_files)
-    
+
     def on_compress_selection_change(self, status_label):
-        """压缩包表格选择变化事件"""
         selected = len(self.compress_tree.selection())
-        status_label.config(text=f"已选中 {selected} 个文件")
+        status_label.config(text=f"已选 {selected} 个")
+
+    def _fmt_size(self, size):
+        """格式化文件大小"""
+        if size is None: return "-"
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.0f}{unit}" if unit == 'B' else f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.1f}TB"
     
     def export_compress_report(self):
         """导出压缩包修复报告"""
@@ -1074,7 +1162,7 @@ class MultiToolGUI:
                     # 统计信息
                     total = len(self.compress_file_list)
                     problem_count = sum(1 for f in self.compress_file_list if f["problem_type"] != "无异常")
-                    fixed_count = sum(1 for f in self.compress_file_list if f["status"] == "修复成功")
+                    fixed_count = sum(1 for f in self.compress_file_list if f["status"] == "已修复")
                     
                     f.write("📊 统计信息：\n")
                     f.write(f"  总文件数：{total}\n")
@@ -1694,53 +1782,102 @@ class MultiToolGUI:
             self.scan_compress_files()
     
     def scan_compress_files(self):
-        """扫描压缩包文件"""
+        """扫描压缩包文件（支持递归、过滤临时文件和非压缩文件）"""
         for item in self.compress_tree.get_children():
             self.compress_tree.delete(item)
         self.compress_file_list = []
-        
+        self.compress_undo_stack = []
+
         target_dir = self.compress_dir_var.get().strip()
         if not target_dir:
             self.update_status("请选择压缩包目录")
+            self.scan_stats_label.config(text="请选择目录")
             return
         if not os.path.isdir(target_dir):
-            self.log(f"⚠️ 压缩包目录不存在：{target_dir}")
-            self.update_status("压缩包目录不存在")
+            self.log(f"目录不存在：{target_dir}")
+            self.update_status("目录不存在")
+            self.scan_stats_label.config(text="目录不存在")
             return
-        
-        file_count = 0
+
+        total_files = 0
+        temp_skip = 0
+        non_compress_skip = 0
         problem_count = 0
-        for filename in os.listdir(target_dir):
-            file_path = os.path.join(target_dir, filename)
-            if not os.path.isfile(file_path):
-                continue
-            
-            file_count += 1
-            problem_type, problem_desc, _, _ = analyze_file_problem(filename)
-            real_suffix = get_file_real_format(file_path)
-            
-            self.compress_file_list.append({
-                "filename": filename,
-                "file_path": file_path,
-                "problem_type": problem_type,
-                "problem_desc": problem_desc,
-                "real_suffix": real_suffix,
-                "status": "待处理"
-            })
-            
-            self.compress_tree.insert("", tk.END, values=(
-                file_count,
-                filename,
-                problem_type,
-                problem_desc,
-                "待处理"
-            ))
-            
-            if problem_type != "无异常":
-                problem_count += 1
-        
-        self.update_status(f"扫描完成 | 总文件：{file_count} | 有问题：{problem_count}")
-        self.log(f"扫描完成，共发现 {file_count} 个文件，其中 {problem_count} 个存在后缀问题")
+        normal_count = 0
+
+        iterator = os.walk(target_dir) if self.recursive_var.get() else [(target_dir, [], os.listdir(target_dir))]
+
+        for root, dirs, files in iterator:
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                try:
+                    fsize = os.path.getsize(file_path)
+                except:
+                    continue
+
+                total_files += 1
+
+                # 跳过下载中临时文件
+                ext_lower = os.path.splitext(filename)[1].lower()
+                if ext_lower in TEMP_DOWNLOAD_SUFFIXES:
+                    temp_skip += 1
+                    continue
+
+                # 检测真实压缩格式（魔数）
+                real_suffix = get_file_real_format(file_path)
+                ext_no_dot = os.path.splitext(filename)[1].lower().lstrip('.')
+
+                # 魔数识别到压缩格式，或文件名本身有标准压缩后缀（如 tar 无魔数，但后缀合法）
+                if real_suffix or ext_no_dot in STANDARD_COMPRESS_SET:
+                    problem_type, problem_desc, correct_body, matched_suffix = analyze_file_problem(filename)
+                    rel_folder = os.path.relpath(root, target_dir) if root != target_dir else ""
+                    if not real_suffix and matched_suffix:
+                        real_suffix = matched_suffix
+                else:
+                    # 魔数检测不到压缩格式 → 检查是否为已知非压缩文件
+                    if ext_lower in NON_COMPRESS_FILE_SUFFIXES:
+                        non_compress_skip += 1
+                        continue
+                    # 无后缀或未知后缀 → 保留但标注"未识别"
+                    problem_type = "未识别格式"
+                    problem_desc = "非标准后缀且魔数无法识别，可能不是压缩文件"
+                    rel_folder = os.path.relpath(root, target_dir) if root != target_dir else ""
+
+                if problem_type != "无异常":
+                    problem_count += 1
+                else:
+                    normal_count += 1
+
+                self.compress_file_list.append({
+                    "filename": filename,
+                    "file_path": file_path,
+                    "folder": rel_folder,
+                    "problem_type": problem_type,
+                    "problem_desc": problem_desc,
+                    "real_suffix": real_suffix,
+                    "size": fsize,
+                    "status": "待处理"
+                })
+
+                self.compress_tree.insert("", tk.END, values=(
+                    len(self.compress_file_list), filename, rel_folder,
+                    real_suffix or "-", problem_type, self._fmt_size(fsize), "待处理"
+                ))
+
+        # 统计信息
+        stats_parts = [f"总 {total_files}"]
+        if temp_skip: stats_parts.append(f"跳过临时 {temp_skip}")
+        if non_compress_skip: stats_parts.append(f"跳过非压缩 {non_compress_skip}")
+        stats_parts.append(f"异常 {problem_count}")
+        stats_text = " | ".join(stats_parts)
+        self.scan_stats_label.config(text=stats_text)
+        self.update_status(f"扫描完成 | {stats_text}")
+        self.log(f"扫描完成：{stats_text}")
+        if temp_skip:
+            self.log(f"  已自动跳过 {temp_skip} 个下载临时文件（.part / .crdownload 等）")
+        if non_compress_skip:
+            self.log(f"  已自动跳过 {non_compress_skip} 个非压缩文件（媒体/文档/系统文件等）")
+        self.compress_undo_stack = []
     
     def select_all_compress(self):
         """全选压缩包文件"""
@@ -1762,7 +1899,7 @@ class MultiToolGUI:
         self.compress_tree.selection_remove(self.compress_tree.selection())
         for item in self.compress_tree.get_children():
             values = self.compress_tree.item(item, "values")
-            if values[2] != "无异常":
+            if values[4] != "无异常":
                 self.compress_tree.selection_add(item)
     
     def ask_user_suffix(self, filename):
@@ -1776,7 +1913,7 @@ class MultiToolGUI:
         ttk.Label(top, text=f"无法自动识别文件格式\n请手动选择压缩后缀：", font=self.normal_font).pack(pady=20)
         
         suffix_var = tk.StringVar(value="rar")
-        suffix_combo = ttk.Combobox(top, textvariable=suffix_var, values=sorted(STANDARD_COMPRESS_SUFFIXES), state="readonly", width=20)
+        suffix_combo = ttk.Combobox(top, textvariable=suffix_var, values=STANDARD_COMPRESS_SUFFIXES, state="readonly", width=20)
         suffix_combo.pack(pady=10)
         
         result = [None]
@@ -1802,66 +1939,140 @@ class MultiToolGUI:
         if not selected_items:
             messagebox.showwarning("提示", "请先选择要修复的文件！")
             return
-        
-        if not messagebox.askyesno("确认", f"确定要修复选中的 {len(selected_items)} 个文件吗？\n修复不会删除原文件，仅生成新的正确文件名的文件"):
+
+        target_suffix = self.target_suffix_var.get().strip()
+        if not target_suffix:
+            messagebox.showwarning("提示", "请选择目标压缩后缀（如 7z / zip / rar）！")
             return
-        
+
+        # 确认对话框
+        confirm = messagebox.askyesno(
+            "确认修复",
+            f"将修复 {len(selected_items)} 个文件\n"
+            f"目标后缀：.{target_suffix}\n\n"
+            f"点击「是」执行修复，点击「否」取消"
+        )
+        if not confirm:
+            return
+
         self.fix_compress_btn.config(state=tk.DISABLED)
+        self.undo_compress_btn.config(state=tk.DISABLED)
         success_count = 0
         fail_count = 0
         skip_count = 0
-        
+        undo_records = []
+
         for item in selected_items:
-            idx = int(self.compress_tree.item(item, "values")[0]) - 1
+            values = self.compress_tree.item(item, "values")
+            idx = int(values[0]) - 1
             file_info = self.compress_file_list[idx]
             filename = file_info["filename"]
             file_path = file_info["file_path"]
             problem_type = file_info["problem_type"]
-            
+
             if problem_type == "无异常":
-                self.log(f"[跳过] {filename}：文件无异常，无需修复")
                 skip_count += 1
                 continue
-            
-            correct_name, _, _ = get_correct_filename(filename, file_info["real_suffix"])
-            if not correct_name:
-                self.log(f"[警告] {filename}：无法自动识别压缩格式")
-                suffix = self.ask_user_suffix(filename)
-                if not suffix:
-                    self.log(f"[跳过] {filename}：用户取消手动指定")
-                    skip_count += 1
-                    continue
-                correct_name = f"{os.path.splitext(filename)[0]}.{suffix}"
-            
+
+            # 生成目标文件名
+            name_body = os.path.splitext(filename)[0]
+            correct_name = f"{name_body}.{target_suffix}"
             correct_path = os.path.join(os.path.dirname(file_path), correct_name)
+
+            # 处理重名
             counter = 1
             while os.path.exists(correct_path):
-                name_body, name_ext = os.path.splitext(correct_name)
-                correct_name = f"{name_body}_{counter}{name_ext}"
+                correct_name = f"{name_body}_{counter}.{target_suffix}"
                 correct_path = os.path.join(os.path.dirname(file_path), correct_name)
                 counter += 1
-            
+
             try:
-                shutil.copy2(file_path, correct_path)  # 复制而非移动，更安全
-                self.compress_file_list[idx]["status"] = "修复成功"
+                os.rename(file_path, correct_path)
+                self.compress_file_list[idx]["status"] = "已修复"
+                self.compress_file_list[idx]["filename"] = correct_name
+                self.compress_file_list[idx]["file_path"] = correct_path
                 self.compress_tree.item(item, values=(
-                    idx+1,
-                    filename,
-                    problem_type,
-                    f"已修复为：{correct_name}",
-                    "修复成功"
+                    idx + 1, correct_name, file_info["folder"],
+                    file_info["real_suffix"] or "-", problem_type,
+                    self._fmt_size(file_info.get("size", 0)), "已修复"
                 ))
-                self.log(f"[成功] {filename} → {correct_name}")
-                self.log(f"  修复类型：{problem_type} | 问题描述：{file_info['problem_desc']}")
+                self.log(f"[修复] {filename} → {correct_name}")
                 success_count += 1
+                undo_records.append((file_path, correct_path, filename, correct_name))
             except Exception as e:
-                self.log(f"[失败] {filename}：修复失败 - {str(e)}")
+                self.log(f"[失败] {filename}：{str(e)}")
                 fail_count += 1
-        
+
+        self.compress_undo_stack.append(undo_records)
         self.fix_compress_btn.config(state=tk.NORMAL)
-        self.log(f"\n===== 修复完成 | 成功：{success_count} | 失败：{fail_count} | 跳过：{skip_count} =====")
-        self.update_status(f"修复完成 | 成功：{success_count} | 失败：{fail_count} | 跳过：{skip_count}")
-        messagebox.showinfo("修复完成", f"修复任务结束\n成功：{success_count} 个\n失败：{fail_count} 个\n跳过：{skip_count} 个")
+        if undo_records:
+            self.undo_compress_btn.config(state=tk.NORMAL)
+
+        self.log(f"===== 修复完成 | 成功 {success_count} | 失败 {fail_count} | 跳过 {skip_count} =====")
+        self.update_status(f"修复完成 | 成功 {success_count}")
+        messagebox.showinfo("完成", f"成功 {success_count} 个 | 失败 {fail_count} 个 | 跳过 {skip_count} 个")
+
+    def undo_compress(self):
+        """撤销上一次修复操作"""
+        if not self.compress_undo_stack:
+            messagebox.showinfo("提示", "没有可撤销的操作")
+            return
+
+        last_batch = self.compress_undo_stack.pop()
+        if not last_batch:
+            messagebox.showinfo("提示", "没有可撤销的操作")
+            return
+
+        confirm = messagebox.askyesno(
+            "确认撤销",
+            f"将撤销上一次修复的 {len(last_batch)} 个文件\n"
+            f"所有文件名将恢复为修改前的原名\n\n"
+            f"点击「是」执行撤销，点击「否」取消"
+        )
+        if not confirm:
+            self.compress_undo_stack.append(last_batch)
+            return
+
+        success = 0
+        fail = 0
+        for old_path, new_path, old_name, new_name in last_batch:
+            try:
+                if os.path.exists(new_path):
+                    os.rename(new_path, old_path)
+                    # 更新列表数据
+                    for fi in self.compress_file_list:
+                        if fi.get("file_path") == new_path:
+                            fi["file_path"] = old_path
+                            fi["filename"] = old_name
+                            fi["status"] = "已撤销"
+                            break
+                    self.log(f"[撤销] {new_name} → {old_name}")
+                    success += 1
+                else:
+                    self.log(f"[撤销跳过] {new_name}：文件不存在（可能已被移动）")
+                    fail += 1
+            except Exception as e:
+                self.log(f"[撤销失败] {new_name}：{str(e)}")
+                fail += 1
+
+        self.log(f"===== 撤销完成 | 成功 {success} | 失败 {fail} =====")
+        self.update_status(f"撤销完成 | 成功 {success}")
+
+        if not self.compress_undo_stack:
+            self.undo_compress_btn.config(state=tk.DISABLED)
+
+        # 刷新表格
+        for item in self.compress_tree.get_children():
+            self.compress_tree.delete(item)
+        for i, fi in enumerate(self.compress_file_list, 1):
+            self.compress_tree.insert("", tk.END, values=(
+                i, fi["filename"], fi.get("folder", ""),
+                fi["real_suffix"] or "-", fi["problem_type"],
+                self._fmt_size(fi.get("size", 0)), fi["status"]
+            ))
+
+        if success > 0:
+            messagebox.showinfo("撤销完成", f"成功撤销 {success} 个文件")
     
     # ===================== 视频处理功能实现 =====================
     def select_video_dir(self):
@@ -2470,6 +2681,331 @@ class MultiToolGUI:
             self.root.after(0, lambda: self.subtitle_status_label.config(text="重命名失败"))
             self.root.after(0, lambda: self.rename_subtitle_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.scan_subtitle_btn.config(state=tk.NORMAL))
+
+    # ===================== 文件名关键词删除 =====================
+    def build_rename_tab(self):
+        """构建文件名关键词删除界面"""
+        self.rename_tab.configure(style="Tab.TFrame")
+        main = ttk.Frame(self.rename_tab)
+        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        intro = ttk.Label(main,
+                          text="批量删除文件名中指定的关键词，支持空格分隔多关键词、递归子文件夹，预览后再执行",
+                          font=("Microsoft YaHei", 9), foreground="#86909C", wraplength=900)
+        intro.pack(fill=tk.X, pady=(0, 6))
+
+        top_card = ttk.LabelFrame(main, text="设置", padding=8)
+        top_card.pack(fill=tk.X, pady=(0, 6))
+
+        dir_row = ttk.Frame(top_card)
+        dir_row.pack(fill=tk.X)
+        ttk.Label(dir_row, text="目标目录：", font=self.normal_font).pack(side=tk.LEFT, padx=(0, 6))
+        self.rename_dir_var = tk.StringVar()
+        ttk.Entry(dir_row, textvariable=self.rename_dir_var, font=self.normal_font, width=40).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(dir_row, text="浏览", command=self._select_rename_dir, width=6).pack(side=tk.LEFT)
+
+        kw_row = ttk.Frame(top_card)
+        kw_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(kw_row, text="删除关键词：", font=self.normal_font).pack(side=tk.LEFT, padx=(0, 6))
+        self.rename_keywords_var = tk.StringVar()
+        ttk.Entry(kw_row, textvariable=self.rename_keywords_var, font=self.normal_font, width=40).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Label(kw_row, text="多关键词用空格分隔", font=("Microsoft YaHei", 9), foreground="#86909C").pack(side=tk.LEFT)
+
+        opt_row = ttk.Frame(top_card)
+        opt_row.pack(fill=tk.X, pady=(6, 0))
+        self.rename_recurse_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row, text="递归处理所有子文件夹", variable=self.rename_recurse_var).pack(side=tk.LEFT)
+
+        btn_card = ttk.LabelFrame(main, text="操作", padding=8)
+        btn_card.pack(fill=tk.X, pady=(0, 6))
+        btn_row = ttk.Frame(btn_card)
+        btn_row.pack(expand=True)
+        ttk.Button(btn_row, text="预览修改效果", command=self._preview_rename, width=14).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="确认执行重命名", command=self._do_rename, style="Primary.TButton", width=14).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="清空日志", command=self.clear_log, width=8).pack(side=tk.LEFT)
+
+    def _select_rename_dir(self):
+        path = filedialog.askdirectory(title="选择目标目录")
+        if path:
+            self.rename_dir_var.set(path)
+
+    def _get_rename_file_list(self):
+        path = self.rename_dir_var.get().strip()
+        if not os.path.isdir(path):
+            return []
+        files = []
+        if self.rename_recurse_var.get():
+            for root_dir, _, filenames in os.walk(path):
+                for f in filenames:
+                    files.append(os.path.join(root_dir, f))
+        else:
+            for f in os.listdir(path):
+                full = os.path.join(path, f)
+                if os.path.isfile(full):
+                    files.append(full)
+        return files
+
+    def _preview_rename(self):
+        self.clear_log()
+        path = self.rename_dir_var.get().strip()
+        kw_str = self.rename_keywords_var.get().strip()
+        if not path or not kw_str:
+            messagebox.showwarning("提示", "请先选择目录并输入关键词")
+            return
+        keywords = kw_str.split()
+        files = self._get_rename_file_list()
+        self.log("===== 预览结果（不会实际修改文件）=====")
+        count = 0
+        for fp in files:
+            old = os.path.basename(fp)
+            new = old
+            for kw in keywords:
+                new = new.replace(kw, "")
+            if old != new:
+                self.log(f"{old}  →  {new}")
+                count += 1
+        self.log(f"\n总计可修改文件：{count} 个")
+        self.update_status(f"预览完成 | 可修改 {count} 个文件")
+
+    def _do_rename(self):
+        path = self.rename_dir_var.get().strip()
+        kw_str = self.rename_keywords_var.get().strip()
+        if not path or not kw_str:
+            messagebox.showwarning("提示", "请先选择目录并输入关键词")
+            return
+        if not messagebox.askyesno("确认", "确定要正式修改文件名吗？修改后无法撤回！"):
+            return
+        self.clear_log()
+        keywords = kw_str.split()
+        files = self._get_rename_file_list()
+        success = 0
+        fail = 0
+        self.log("===== 开始执行重命名 =====")
+        for fp in files:
+            d = os.path.dirname(fp)
+            old = os.path.basename(fp)
+            new = old
+            for kw in keywords:
+                new = new.replace(kw, "")
+            if old == new:
+                continue
+            new_path = os.path.join(d, new)
+            if os.path.exists(new_path):
+                self.log(f"跳过：{old}  目标文件已存在")
+                fail += 1
+                continue
+            try:
+                os.rename(fp, new_path)
+                self.log(f"成功：{old} → {new}")
+                success += 1
+            except Exception as e:
+                self.log(f"失败：{old}  错误：{e}")
+                fail += 1
+        self.log(f"\n执行完成：成功 {success} 个，失败 {fail} 个")
+        self.update_status(f"重命名完成 | 成功 {success} | 失败 {fail}")
+        messagebox.showinfo("完成", f"操作结束\n成功：{success}\n失败：{fail}")
+
+    # ===================== 发票金额计算 =====================
+    def build_invoice_tab(self):
+        """构建发票金额计算界面"""
+        self.invoice_tab.configure(style="Tab.TFrame")
+        main = ttk.Frame(self.invoice_tab)
+        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        intro = ttk.Label(main,
+                          text="自动递归扫描发票 PDF/图片，识别金额并分类汇总（住宿/打车/高铁/其他），输出大写合计",
+                          font=("Microsoft YaHei", 9), foreground="#86909C", wraplength=900)
+        intro.pack(fill=tk.X, pady=(0, 6))
+
+        top_card = ttk.LabelFrame(main, text="设置", padding=8)
+        top_card.pack(fill=tk.X, pady=(0, 6))
+
+        dir_row = ttk.Frame(top_card)
+        dir_row.pack(fill=tk.X)
+        ttk.Label(dir_row, text="发票根目录：", font=self.normal_font).pack(side=tk.LEFT, padx=(0, 6))
+        self.invoice_dir_var = tk.StringVar()
+        ttk.Entry(dir_row, textvariable=self.invoice_dir_var, font=self.normal_font, width=40).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(dir_row, text="浏览", command=self._select_invoice_dir, width=6).pack(side=tk.LEFT)
+
+        rule_label = ttk.Label(top_card,
+                               text="规则：住宿/高铁只认正式发票 | 打车有发票用发票，无发票有行程单即可入账",
+                               font=("Microsoft YaHei", 9), foreground="#E74C3C")
+        rule_label.pack(anchor=tk.W, pady=(6, 0))
+
+        btn_card = ttk.LabelFrame(main, text="操作", padding=8)
+        btn_card.pack(fill=tk.X, pady=(0, 6))
+        btn_row = ttk.Frame(btn_card)
+        btn_row.pack(expand=True)
+        self.invoice_start_btn = ttk.Button(btn_row, text="开始计算", command=self._start_invoice_calc,
+                                            style="Primary.TButton", width=14)
+        self.invoice_start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="清空日志", command=self.clear_log, width=8).pack(side=tk.LEFT)
+
+    def _select_invoice_dir(self):
+        path = filedialog.askdirectory(title="选择发票根文件夹")
+        if path:
+            self.invoice_dir_var.set(path)
+
+    def _start_invoice_calc(self):
+        root_dir = self.invoice_dir_var.get().strip()
+        if not os.path.isdir(root_dir):
+            messagebox.showerror("错误", "请先选择发票根文件夹")
+            return
+        if not fitz:
+            messagebox.showerror("缺少依赖", "请安装 PyMuPDF：pip install PyMuPDF")
+            return
+
+        self.invoice_start_btn.config(state=tk.DISABLED)
+        self.log("\n" + "=" * 60)
+        self.log("开始发票金额计算")
+        self.log("=" * 60)
+
+        hotel = taxi = train = other = 0.0
+        total_invoices = taxi_no_invoice = mismatch_count = 0
+
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            pdfs = [f for f in filenames if f.lower().endswith('.pdf')]
+            imgs = [f for f in filenames if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            if not pdfs and not imgs:
+                continue
+
+            self.log(f"\n处理报销单：{os.path.basename(dirpath)}")
+            invoice_amt = None
+            invoice_cap = ""
+            itinerary_amt = None
+            payment_amt = None
+            category = "其他"
+            has_itinerary = False
+
+            for pdf in pdfs:
+                pdf_path = os.path.join(dirpath, pdf)
+                try:
+                    doc = fitz.open(pdf_path)
+                    text = doc[0].get_text()
+                    doc.close()
+                    if _is_formal_invoice(text):
+                        amt, cap = _extract_any_amount(text)
+                        if amt:
+                            invoice_amt = amt
+                            invoice_cap = cap
+                            category = _classify_invoice(text)
+                            self.log(f"  找到正式发票：{pdf}")
+                            self.log(f"  发票金额：{invoice_cap} = ¥{invoice_amt:.2f}")
+                            break
+                except:
+                    continue
+
+            for pdf in pdfs:
+                pdf_path = os.path.join(dirpath, pdf)
+                try:
+                    doc = fitz.open(pdf_path)
+                    text = doc[0].get_text()
+                    doc.close()
+                    if _is_itinerary(text):
+                        has_itinerary = True
+                        amt, _ = _extract_any_amount(text)
+                        if amt:
+                            itinerary_amt = amt
+                            self.log(f"  找到行程单：{pdf}，金额：¥{itinerary_amt:.2f}")
+                            if category == "其他":
+                                category = "打车"
+                            break
+                except:
+                    continue
+
+            if imgs and Image and pytesseract:
+                img_path = os.path.join(dirpath, imgs[0])
+                try:
+                    img = Image.open(img_path)
+                    text = pytesseract.image_to_string(img, lang='chi_sim')
+                    amt, _ = _extract_any_amount(text)
+                    if amt:
+                        payment_amt = amt
+                        self.log(f"  找到支付截图：{imgs[0]}，金额：¥{payment_amt:.2f}")
+                except:
+                    pass
+
+            final_amt = None
+            if invoice_amt is not None:
+                final_amt = invoice_amt
+                self.log(f"  入账方式：正式发票")
+            elif category == "打车" and has_itinerary and itinerary_amt is not None:
+                final_amt = itinerary_amt
+                taxi_no_invoice += 1
+                self.log(f"  入账方式：无发票（仅行程单）【打车专属】")
+            else:
+                self.log(f"  不符合入账条件，跳过")
+                continue
+
+            self.log(f"  最终入账金额：¥{final_amt:.2f}")
+
+            all_match = True
+            if invoice_amt and itinerary_amt and abs(invoice_amt - itinerary_amt) > 0.01:
+                self.log(f"  行程单金额不一致！发票：¥{invoice_amt:.2f}，行程单：¥{itinerary_amt:.2f}")
+                all_match = False
+                mismatch_count += 1
+            if invoice_amt and payment_amt and abs(invoice_amt - payment_amt) > 0.01:
+                self.log(f"  支付截图金额不一致！发票：¥{invoice_amt:.2f}，截图：¥{payment_amt:.2f}")
+                all_match = False
+                mismatch_count += 1
+            if not invoice_amt and payment_amt and abs(final_amt - payment_amt) > 0.01:
+                self.log(f"  行程单与支付截图不一致！行程单：¥{final_amt:.2f}，截图：¥{payment_amt:.2f}")
+                all_match = False
+                mismatch_count += 1
+            if all_match:
+                self.log(f"  所有凭证金额一致")
+
+            if category == '住宿':
+                hotel += final_amt
+            elif category == '打车':
+                taxi += final_amt
+            elif category == '高铁':
+                train += final_amt
+            else:
+                other += final_amt
+            total_invoices += 1
+
+        grand_total = hotel + taxi + train + other
+        grand_total_rmb = _num_to_rmb(grand_total)
+
+        txt_path = os.path.join(root_dir, "发票金额汇总.txt")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(f"住宿费小计：¥{hotel:.2f}\n")
+            f.write(f"打车费小计：¥{taxi:.2f}\n")
+            f.write(f"高铁费小计：¥{train:.2f}\n")
+            f.write(f"合计：¥{grand_total:.2f}\n")
+            f.write(f"大写：{grand_total_rmb}\n")
+
+        self.log("\n" + "=" * 60)
+        self.log("计算完成！")
+        self.log("=" * 60)
+        self.log(f"总入账笔数：{total_invoices} 笔")
+        self.log(f"其中无发票打车费：{taxi_no_invoice} 笔")
+        self.log(f"金额不一致：{mismatch_count} 笔")
+        self.log(f"住宿费：¥{hotel:.2f}")
+        self.log(f"打车费：¥{taxi:.2f}")
+        self.log(f"高铁费：¥{train:.2f}")
+        if other > 0:
+            self.log(f"其他费用：¥{other:.2f}")
+        self.log(f"合计：¥{grand_total:.2f}")
+        self.log(f"大写：{grand_total_rmb}")
+        self.log(f"\n汇总文件：{txt_path}")
+        self.update_status(f"计算完成 | 共 {total_invoices} 笔 | 合计 ¥{grand_total:.2f}")
+
+        self.invoice_start_btn.config(state=tk.NORMAL)
+        messagebox.showinfo("完成",
+                            f"计算完成！\n\n"
+                            f"总入账：{total_invoices} 笔\n"
+                            f"无发票打车费：{taxi_no_invoice} 笔\n"
+                            f"金额不一致：{mismatch_count} 笔\n\n"
+                            f"住宿费：¥{hotel:.2f}\n"
+                            f"打车费：¥{taxi:.2f}\n"
+                            f"高铁费：¥{train:.2f}\n"
+                            f"合计：¥{grand_total:.2f}\n"
+                            f"大写：{grand_total_rmb}")
 
 # ===================== 程序入口 =====================
 if __name__ == "__main__":
